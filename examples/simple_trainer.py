@@ -231,45 +231,58 @@ def create_splats_with_optimizers(
     world_rank: int = 0,
     world_size: int = 1,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
+    # 3Dガウススプラットの初期化関数
+    # 各ガウシアンの物理的パラメータ（位置、サイズ、方向、不透明度、色）を設定
     if init_type == "sfm":
+        # SfM（Structure from Motion）から得られた3D点群を初期位置として使用
+        # これにより現実的な3D構造から学習を開始できる
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
     elif init_type == "random":
+        # ランダムに3D空間に点を配置して初期化
+        # SfM点群が利用できない場合の代替手段
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
     else:
         raise ValueError("Please specify a correct init_type: sfm or random")
 
-    # Initialize the GS size to be the average dist of the 3 nearest neighbors
+    # ガウシアンのスケール（サイズ）を k-近傍法で自動決定
+    # 各点の3近傍点との平均距離を計算し、局所的な密度に応じたサイズを設定
+    # これにより密度の高い領域では小さく、疎な領域では大きなガウシアンが配置される
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
     dist_avg = torch.sqrt(dist2_avg)
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
-    # Distribute the GSs to different ranks (also works for single rank)
+    # 分散学習用：ガウシアンを複数GPUに分散配置
     points = points[world_rank::world_size]
     rgbs = rgbs[world_rank::world_size]
     scales = scales[world_rank::world_size]
 
     N = points.shape[0]
+    # クォータニオンでガウシアンの3D回転を表現（初期値はランダム）
     quats = torch.rand((N, 4))  # [N, 4]
+    # 不透明度をlogit空間で初期化（最適化の安定性のため）
     opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
 
+    # ガウシアンの各物理パラメータを学習可能パラメータとして設定
     params = [
         # name, value, lr
-        ("means", torch.nn.Parameter(points), means_lr * scene_scale),
-        ("scales", torch.nn.Parameter(scales), scales_lr),
-        ("quats", torch.nn.Parameter(quats), quats_lr),
-        ("opacities", torch.nn.Parameter(opacities), opacities_lr),
+        ("means", torch.nn.Parameter(points), means_lr * scene_scale),      # 3D位置
+        ("scales", torch.nn.Parameter(scales), scales_lr),                  # サイズ（楕円体の軸長）
+        ("quats", torch.nn.Parameter(quats), quats_lr),                    # 方向（クォータニオン）
+        ("opacities", torch.nn.Parameter(opacities), opacities_lr),        # 不透明度
     ]
 
     if feature_dim is None:
-        # color is SH coefficients.
+        # 球面調和関数（Spherical Harmonics, SH）で視点依存の色を表現
+        # SH係数により任意の視点からの見た目を数学的にモデル化
         colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
-        colors[:, 0, :] = rgb_to_sh(rgbs)
-        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
-        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+        colors[:, 0, :] = rgb_to_sh(rgbs)  # DC成分（基本色）
+        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))  # SH 0次項（環境光）
+        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))  # SH 高次項（方向性照明）
     else:
-        # features will be used for appearance and view-dependent shading
+        # 外観最適化用の特徴量ベース色表現
+        # 複雑な材質特性や照明変化に対応可能
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
         params.append(("features", torch.nn.Parameter(features), sh0_lr))
         colors = torch.logit(rgbs)  # [N, 3]
@@ -490,52 +503,63 @@ class Runner:
         camera_model: Optional[Literal["pinhole", "ortho", "fisheye"]] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
-        means = self.splats["means"]  # [N, 3]
+        # ラスタライゼーション：3Dガウシアンから2D画像を生成
+        # 各ガウシアンを楕円として画面投影し、奥行きソートしてブレンド
+        # ガウシアンパラメータの物理的解釈への変換
+        means = self.splats["means"]  # [N, 3] 3D空間での位置座標
         # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
         # rasterization does normalization internally
-        quats = self.splats["quats"]  # [N, 4]
-        scales = torch.exp(self.splats["scales"])  # [N, 3]
-        opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
+        quats = self.splats["quats"]  # [N, 4] クォータニオンによる回転（方向）
+        scales = torch.exp(self.splats["scales"])  # [N, 3] 対数スケールから実際のサイズへ変換
+        opacities = torch.sigmoid(self.splats["opacities"])  # [N,] logitから不透明度[0,1]へ変換
 
         image_ids = kwargs.pop("image_ids", None)
+        # 色の計算：視点依存の色表現
         if self.cfg.app_opt:
+            # 外観最適化モード：特徴量から視点・照明依存の色を生成
+            # 複雑な材質特性（反射、透過等）を学習可能
             colors = self.app_module(
                 features=self.splats["features"],
-                embed_ids=image_ids,
-                dirs=means[None, :, :] - camtoworlds[:, None, :3, 3],
+                embed_ids=image_ids,  # 画像固有の外観変化（照明条件等）
+                dirs=means[None, :, :] - camtoworlds[:, None, :3, 3],  # 視線方向
                 sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
             )
             colors = colors + self.splats["colors"]
             colors = torch.sigmoid(colors)
         else:
+            # 球面調和関数モード：視点角度に応じた色変化を数学的にモデル化
             colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
 
         if rasterize_mode is None:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
         if camera_model is None:
             camera_model = self.cfg.camera_model
+        # CUDAカーネルによる高速ラスタライゼーション実行
+        # 1. 3Dガウシアンを2D楕円として投影
+        # 2. 深度でソートしてピクセル単位でアルファブレンディング
+        # 3. 微分可能レンダリングで勾配計算を可能に
         render_colors, render_alphas, info = rasterization(
-            means=means,
-            quats=quats,
-            scales=scales,
-            opacities=opacities,
-            colors=colors,
-            viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
-            Ks=Ks,  # [C, 3, 3]
+            means=means,                                          # 3D位置
+            quats=quats,                                         # 回転（方向）
+            scales=scales,                                       # サイズ
+            opacities=opacities,                                 # 不透明度
+            colors=colors,                                       # 色（視点依存）
+            viewmats=torch.linalg.inv(camtoworlds),             # [C, 4, 4] カメラ変換行列
+            Ks=Ks,                                              # [C, 3, 3] カメラ内部パラメータ
             width=width,
             height=height,
-            packed=self.cfg.packed,
+            packed=self.cfg.packed,                             # メモリ効率化モード
             absgrad=(
                 self.cfg.strategy.absgrad
                 if isinstance(self.cfg.strategy, DefaultStrategy)
                 else False
-            ),
-            sparse_grad=self.cfg.sparse_grad,
+            ),                                                  # 勾配の絶対値計算
+            sparse_grad=self.cfg.sparse_grad,                   # スパース勾配最適化
             rasterize_mode=rasterize_mode,
-            distributed=self.world_size > 1,
-            camera_model=self.cfg.camera_model,
-            with_ut=self.cfg.with_ut,
-            with_eval3d=self.cfg.with_eval3d,
+            distributed=self.world_size > 1,                    # 分散処理
+            camera_model=self.cfg.camera_model,                 # カメラモデル（ピンホール等）
+            with_ut=self.cfg.with_ut,                          # 不確実性変換
+            with_eval3d=self.cfg.with_eval3d,                  # 3D評価モード
             **kwargs,
         )
         if masks is not None:
@@ -543,6 +567,8 @@ class Runner:
         return render_colors, render_alphas, info
 
     def train(self):
+        # メイン学習ループ：3Dガウススプラットの最適化プロセス
+        # 画像のレンダリング誤差を最小化してガウシアンパラメータを調整
         cfg = self.cfg
         device = self.device
         world_rank = self.world_rank
@@ -556,6 +582,8 @@ class Runner:
         max_steps = cfg.max_steps
         init_step = 0
 
+        # 学習率スケジューラー：学習の進行とともに学習率を徐々に減少
+        # 位置パラメータは特に慎重に調整（最終的に初期値の1%まで減少）
         schedulers = [
             # means has a learning rate schedule, that end at 0.01 of the initial value
             torch.optim.lr_scheduler.ExponentialLR(
@@ -596,7 +624,7 @@ class Runner:
         )
         trainloader_iter = iter(trainloader)
 
-        # Training loop.
+        # 学習ループ開始：各ステップで画像をレンダリングし誤差を計算
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
@@ -606,20 +634,22 @@ class Runner:
                 self.viewer.lock.acquire()
                 tic = time.time()
 
+            # 学習データのランダムサンプリング
             try:
                 data = next(trainloader_iter)
             except StopIteration:
                 trainloader_iter = iter(trainloader)
                 data = next(trainloader_iter)
 
-            camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
-            Ks = data["K"].to(device)  # [1, 3, 3]
-            pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
+            # カメラパラメータと目標画像の取得
+            camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4] カメラ-世界座標変換行列
+            Ks = data["K"].to(device)  # [1, 3, 3] カメラ内部パラメータ（焦点距離、画像中心）
+            pixels = data["image"].to(device) / 255.0  # [1, H, W, 3] 目標RGB画像（正規化済み）
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
-            image_ids = data["image_id"].to(device)
-            masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+            image_ids = data["image_id"].to(device)  # 画像識別子（外観最適化用）
+            masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W] オクルージョンマスク
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
@@ -632,10 +662,12 @@ class Runner:
             if cfg.pose_opt:
                 camtoworlds = self.pose_adjust(camtoworlds, image_ids)
 
-            # sh schedule
+            # 球面調和関数の次数を段階的に増加（粗い表現から細かい表現へ）
+            # 初期は低次項のみで学習を安定化、後に高次項を追加して詳細を表現
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
-            # forward
+            # フォワードパス：3Dガウシアンを2D画像にレンダリング
+            # 各ガウシアンを楕円として投影し、アルファブレンディングで合成
             renders, alphas, info = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
@@ -667,10 +699,14 @@ class Runner:
                     image_ids.unsqueeze(-1),
                 )["rgb"]
 
+            # ランダム背景：透明度を適切に学習するため背景色をランダム化
+            # これにより背景への依存を避け、前景オブジェクトの透明度を正確に推定
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
 
+            # 密度化戦略の前処理：勾配情報の収集
+            # レンダリング結果から各ガウシアンの重要度を評価し、後の密度化判定に使用
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
                 optimizers=self.optimizers,
@@ -679,12 +715,15 @@ class Runner:
                 info=info,
             )
 
-            # loss
-            l1loss = F.l1_loss(colors, pixels)
+            # 損失関数計算：レンダリング画像と実画像の差を評価
+            l1loss = F.l1_loss(colors, pixels)  # L1損失：ピクセル単位の絶対誤差
             ssimloss = 1.0 - fused_ssim(
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-            )
+            )  # SSIM損失：構造的類似性（人間の視覚に近い評価指標）
+            # 両方の損失を組み合わせて総合的な画質を最適化
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+            # 深度損失：3D構造の幾何学的制約
+            # 既知の深度情報を使って3D再構成の精度を向上
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -699,7 +738,7 @@ class Runner:
                     depths.permute(0, 3, 1, 2), grid, align_corners=True
                 )  # [1, 1, M, 1]
                 depths = depths.squeeze(3).squeeze(1)  # [1, M]
-                # calculate loss in disparity space
+                # 視差空間で損失計算（遠近感の線形化）
                 disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
                 disp_gt = 1.0 / depths_gt  # [1, M]
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
@@ -708,12 +747,16 @@ class Runner:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
 
-            # regularizations
+            # 正則化項：過学習防止とモデルの安定化
             if cfg.opacity_reg > 0.0:
+                # 不透明度正則化：不必要に不透明なガウシアンを抑制
                 loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
             if cfg.scale_reg > 0.0:
+                # スケール正則化：過度に大きなガウシアンを抑制し、詳細な表現を促進
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
+            # バックプロパゲーション：損失の勾配を計算
+            # 各ガウシアンパラメータに対する最適化方向を決定
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
@@ -839,27 +882,35 @@ class Runner:
                 else:
                     visibility_mask = (info["radii"] > 0).all(-1).any(0)
 
-            # optimize
+            # パラメータ更新：勾配降下法による最適化
+            # 各種パラメータ（位置、サイズ、方向、不透明度、色）を同時に更新
             for optimizer in self.optimizers.values():
                 if cfg.visible_adam:
+                    # 可視ガウシアンのみ更新（計算効率化）
                     optimizer.step(visibility_mask)
                 else:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            # カメラ姿勢最適化（カメラキャリブレーション誤差の補正）
             for optimizer in self.pose_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            # 外観モデル最適化（照明変化への適応）
             for optimizer in self.app_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            # バイラテラルグリッド最適化（高次画像処理）
             for optimizer in self.bil_grid_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            # 学習率更新
             for scheduler in schedulers:
                 scheduler.step()
 
-            # Run post-backward steps after backward and optimizer
+            # 密度化戦略の実行：ガウシアンの動的な追加・削除・分割
+            # 勾配情報に基づいて詳細が不足している領域に新しいガウシアンを配置
             if isinstance(self.cfg.strategy, DefaultStrategy):
+                # 標準戦略：勾配しきい値に基づく分割・複製・プルーニング
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
                     optimizers=self.optimizers,
@@ -869,6 +920,7 @@ class Runner:
                     packed=cfg.packed,
                 )
             elif isinstance(self.cfg.strategy, MCMCStrategy):
+                # MCMC戦略：確率的サンプリングに基づく最適化
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
                     optimizers=self.optimizers,
@@ -904,7 +956,8 @@ class Runner:
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
-        """Entry for evaluation."""
+        """評価フェーズ：学習したモデルの品質を測定"""
+        # テスト画像でのレンダリング品質をPSNR、SSIM、LPIPS等で評価
         print("Running evaluation...")
         cfg = self.cfg
         device = self.device
@@ -923,8 +976,10 @@ class Runner:
             masks = data["mask"].to(device) if "mask" in data else None
             height, width = pixels.shape[1:3]
 
+            # GPU同期してレンダリング時間を正確に測定
             torch.cuda.synchronize()
             tic = time.time()
+            # 学習済みモデルで新視点画像を生成
             colors, _, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
@@ -950,11 +1005,12 @@ class Runner:
                     canvas,
                 )
 
+                # 画質評価指標の計算
                 pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                metrics["psnr"].append(self.psnr(colors_p, pixels_p))
-                metrics["ssim"].append(self.ssim(colors_p, pixels_p))
-                metrics["lpips"].append(self.lpips(colors_p, pixels_p))
+                metrics["psnr"].append(self.psnr(colors_p, pixels_p))    # PSNR: 信号対雑音比
+                metrics["ssim"].append(self.ssim(colors_p, pixels_p))    # SSIM: 構造的類似性
+                metrics["lpips"].append(self.lpips(colors_p, pixels_p))  # LPIPS: 知覚的類似性
                 if cfg.use_bilateral_grid:
                     cc_colors = color_correct(colors, pixels)
                     cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
