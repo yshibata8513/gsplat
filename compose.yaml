@@ -1,0 +1,25 @@
+services:
+  gsplat-dev:
+    shm_size: "8g"   # 例: 8GB
+    ipc: host        # 共有メモリを広く使える
+    network_mode: host   # ← net: host の正式書き方
+    build:
+      context: .
+      args:
+        TORCH_CUDA_ARCH_LIST: "7.5"
+        MAX_JOBS: 6
+    container_name: gsplat-dev_modified
+    working_dir: /workspace
+    volumes:
+      - /home/yshibata/gsplat:/workspace/gsplat:rw
+      # - /path/to/datasets:/workspace/datasets:ro  # 任意
+    gpus: all
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      # ※ PIP_* はここに置かない
+    stdin_open: true
+    tty: true
+    # （任意）ビューワ等を使うならポート公開
+    # ports:
+    #   - "7007:7007"   # nerfview 例
