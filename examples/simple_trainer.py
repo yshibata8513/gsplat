@@ -77,15 +77,19 @@ class Config:
     steps_scaler: float = 1.0
 
     # Number of training steps
-    max_steps: int = 30_000
+    # max_steps: int = 30_000  # 元の値（通常品質用）
+    max_steps: int = 10_000    # 高速プレビュー用
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
-    # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    # eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])  # 元の値
+    eval_steps: List[int] = field(default_factory=lambda: [5_000, 10_000])    # 高速プレビュー用
+    # Steps to save the model  
+    # save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])  # 元の値
+    save_steps: List[int] = field(default_factory=lambda: [5_000, 10_000])    # 高速プレビュー用
     # Whether to save ply file (storage size can be large)
-    save_ply: bool = False
+    save_ply: bool = True     # プレビュー用にPLYファイル出力を有効化
     # Steps to save the model as ply
-    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    # ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])  # 元の値
+    ply_steps: List[int] = field(default_factory=lambda: [5_000, 10_000])    # 高速プレビュー用
     # Whether to disable video generation during training and evaluation
     disable_video: bool = False
 
