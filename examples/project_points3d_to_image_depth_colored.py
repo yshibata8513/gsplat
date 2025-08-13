@@ -1,9 +1,29 @@
 #!/usr/bin/env python3
 """
-Visualize points3D.bin with depth-based color coding
+Project COLMAP points3D.bin to images with depth-based color coding
+
+This script visualizes 3D point clouds from COLMAP reconstructions by projecting them
+onto 2D images with depth-based color coding. It uses gsplat's coordinate system and
+transformation pipeline for accurate projection.
+
+Features:
+- Projects all COLMAP points3D.bin points to camera images
+- Color codes points by depth (near=purple, far=yellow by default)
+- Creates both overlay (points on original image) and black background visualizations
+- Supports multiple datasets (bicycle, facade, etc.)
+- Configurable colormaps (viridis, plasma, jet, etc.)
+
+Usage:
+    python project_points3d_to_image_depth_colored.py [dataset] [num_images] [colormap]
+    
+Examples:
+    python project_points3d_to_image_depth_colored.py bicycle 3 viridis
+    python project_points3d_to_image_depth_colored.py facade 5 plasma
+    python project_points3d_to_image_depth_colored.py  # defaults to bicycle
 """
 
 import os
+import sys
 import numpy as np
 import cv2
 import json
@@ -17,6 +37,8 @@ def depth_to_color(depths, colormap='viridis'):
     """
     # Normalize depths to 0-1 range
     depths_normalized = (depths - depths.min()) / (depths.max() - depths.min())
+
+    # depths_normalized = 1. - depths_normalized
     
     # Apply colormap
     cmap = cm.get_cmap(colormap)
@@ -91,11 +113,51 @@ def create_colorbar(depths, output_path, colormap='viridis'):
     plt.close()
 
 def main():
-    # Configuration
-    data_dir = "/workspace/gsplat/examples/data/360_v2/bicycle"
-    output_dir = "/workspace/gsplat/examples/points3d_depth_colored"
-    num_images_to_process = 3
-    colormap = 'viridis'  # Options: 'viridis', 'plasma', 'inferno', 'magma', 'jet', 'turbo'
+    # Parse command line arguments
+    dataset = sys.argv[1] if len(sys.argv) > 1 else 'bicycle'
+    num_images_to_process = int(sys.argv[2]) if len(sys.argv) > 2 else 3
+    colormap = sys.argv[3] if len(sys.argv) > 3 else 'viridis'
+    
+    # Dataset configuration
+    dataset_configs = {
+        'bicycle': {
+            'data_dir': "/workspace/gsplat/examples/data/360_v2/bicycle",
+            'output_dir': "/workspace/gsplat/examples/bicycle_depth_colored",
+            'default_num_images': 3
+        },
+        'facade': {
+            'data_dir': "/workspace/gsplat/examples/data/facade",
+            'output_dir': "/workspace/gsplat/examples/facade_depth_colored",
+            'default_num_images': 5
+        }
+    }
+    
+    if dataset not in dataset_configs:
+        print(f"Error: Unknown dataset '{dataset}'. Available: {list(dataset_configs.keys())}")
+        sys.exit(1)
+    
+    config = dataset_configs[dataset]
+    data_dir = config['data_dir']
+    output_dir = config['output_dir']
+    
+    # Use default number of images for dataset if not specified
+    if len(sys.argv) <= 2:
+        num_images_to_process = config['default_num_images']
+    
+    print(f"Dataset: {dataset}")
+    print(f"Processing {num_images_to_process} images")
+    print(f"Colormap: {colormap}")
+    print(f"Data directory: {data_dir}")
+    print(f"Output directory: {output_dir}")
+    
+    # Validate colormap
+    available_colormaps = ['viridis', 'plasma', 'inferno', 'magma', 'jet', 'turbo', 'cool', 'hot']
+    if colormap not in available_colormaps:
+        print(f"Warning: '{colormap}' may not be available. Recommended: {available_colormaps}")
+    
+    if not os.path.exists(data_dir):
+        print(f"Error: Data directory does not exist: {data_dir}")
+        sys.exit(1)
     
     os.makedirs(output_dir, exist_ok=True)
     
@@ -132,9 +194,10 @@ def main():
         print(f"  Projected {projected_points}/{total_points} points ({percentage:.1f}%)")
         print(f"  Depth range: {depths.min():.3f} - {depths.max():.3f}")
         
-        # Create depth-colored visualizations
-        overlay_path = os.path.join(output_dir, f"depth_{colormap}_{i:03d}_{image_name}_overlay.jpg")
-        black_bg_path = os.path.join(output_dir, f"depth_{colormap}_{i:03d}_{image_name}_black_bg.jpg")
+        # Create depth-colored visualizations (clean filename)
+        clean_image_name = os.path.basename(image_name)
+        overlay_path = os.path.join(output_dir, f"depth_{colormap}_{i:03d}_{clean_image_name}_overlay.jpg")
+        black_bg_path = os.path.join(output_dir, f"depth_{colormap}_{i:03d}_{clean_image_name}_black_bg.jpg")
         
         visualize_depth_colored(image_path, points_2d, depths, overlay_path, mode='overlay', colormap=colormap)
         visualize_depth_colored(image_path, points_2d, depths, black_bg_path, mode='black_background', colormap=colormap)
