@@ -99,6 +99,9 @@ class Config:
     init_num_pts: int = 100_000
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
+    # Use random colors for SfM initialization instead of point colors
+    sfm_random_colors: bool = False
+    
     # Degree of spherical harmonics
     sh_degree: int = 3
     # Turn on another SH degree every this steps
@@ -234,6 +237,7 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
+    sfm_random_colors: bool = False,  # SfM初期化時にランダム色を使用
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     # 3Dガウススプラットの初期化関数
     # 各ガウシアンの物理的パラメータ（位置、サイズ、方向、不透明度、色）を設定
@@ -241,7 +245,12 @@ def create_splats_with_optimizers(
         # SfM（Structure from Motion）から得られた3D点群を初期位置として使用
         # これにより現実的な3D構造から学習を開始できる
         points = torch.from_numpy(parser.points).float()
-        rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
+        if sfm_random_colors:
+            # ランダム色を使用（色情報が不正確な場合に有効）
+            rgbs = torch.rand((points.shape[0], 3))
+            print(f"[SfM初期化] ランダム色を使用: {points.shape[0]}点")
+        else:
+            rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
     elif init_type == "random":
         # ランダムに3D空間に点を配置して初期化
         # SfM点群が利用できない場合の代替手段
@@ -255,6 +264,7 @@ def create_splats_with_optimizers(
     # これにより密度の高い領域では小さく、疎な領域では大きなガウシアンが配置される
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
     dist_avg = torch.sqrt(dist2_avg)
+    
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
     # 分散学習用：ガウシアンを複数GPUに分散配置
@@ -265,6 +275,7 @@ def create_splats_with_optimizers(
     N = points.shape[0]
     # クォータニオンでガウシアンの3D回転を表現（初期値はランダム）
     quats = torch.rand((N, 4))  # [N, 4]
+    
     # 不透明度をlogit空間で初期化（最適化の安定性のため）
     opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
 
@@ -388,6 +399,7 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            sfm_random_colors=cfg.sfm_random_colors,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
@@ -538,10 +550,14 @@ class Runner:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
         if camera_model is None:
             camera_model = self.cfg.camera_model
-        # CUDAカーネルによる高速ラスタライゼーション実行
+        # CUDAカーネルによる高速ラスタライゼーション実行（バッチ処理対応）
         # 1. 3Dガウシアンを2D楕円として投影
         # 2. 深度でソートしてピクセル単位でアルファブレンディング
         # 3. 微分可能レンダリングで勾配計算を可能に
+        # 
+        # バッチサイズC = cfg.batch_size（デフォルト値1、82行目参照）
+        # コマンドライン引数 --batch_size で変更可能だが、メモリ制約のため通常は1を使用
+        # 評価時は常にbatch_size=1で固定（1039行目参照）
         render_colors, render_alphas, info = rasterization(
             means=means,                                          # 3D位置
             quats=quats,                                         # 回転（方向）
