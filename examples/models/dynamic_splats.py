@@ -23,6 +23,7 @@ sys.path.append('/workspace/gsplat/examples')
 
 from utils.quaternion_utils import (
     quaternion_multiply, 
+    quaternion_multiply_batch,
     quaternion_to_rotation_matrix,
     rotation_matrix_to_quaternion
 )
@@ -275,10 +276,19 @@ class DynamicGaussianSplats(nn.Module):
         # 2. 回転変換: quats_world = quat_actor * quats_local
         if "quats" in local_splats:
             local_quats = F.normalize(local_splats["quats"], dim=-1)  # [N, 4]
-            # 各ガウシアンの回転にアクター回転を適用
-            world_quats = torch.stack([
-                quaternion_multiply(quaternion, q) for q in local_quats
-            ])  # [N, 4]
+            # 各ガウシアンの回転にアクター回転を適用（ベクトル化）
+            N = local_quats.shape[0]
+            actor_quat_batch = quaternion.unsqueeze(0).expand(N, -1)  # [N, 4]
+            world_quats = quaternion_multiply_batch(actor_quat_batch, local_quats)
+            
+            # NaN/Inf check - これが数値不安定性の原因
+            if torch.isnan(world_quats).any() or torch.isinf(world_quats).any():
+                print(f"WARNING: NaN/Inf detected in quaternion transformation for actor {actor_id}")
+                print(f"  actor_quat: {quaternion}")
+                print(f"  local_quats range: [{local_quats.min():.6f}, {local_quats.max():.6f}]")
+                print(f"  world_quats NaN count: {torch.isnan(world_quats).sum()}")
+                print(f"  world_quats Inf count: {torch.isinf(world_quats).sum()}")
+            
             transformed["quats"] = world_quats
         
         # 3. その他のパラメータは不変
