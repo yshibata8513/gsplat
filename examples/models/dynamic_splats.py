@@ -288,16 +288,31 @@ class DynamicGaussianSplats(nn.Module):
         
         return transformed
     
-    def get_combined_gaussians(self, time: float) -> Dict[str, torch.Tensor]:
+    def get_combined_gaussians(self, 
+                             time: Optional[float] = None,
+                             frame_data: Optional[Dict] = None) -> Dict[str, torch.Tensor]:
         """
         指定時刻での静的+動的ガウシアンの統合
         
         Args:
-            time: 時刻
+            time: 時刻（後方互換性のため残す）
+            frame_data: PandaSetDatasetの__getitem__出力
+                - actor_interpolation: 可視アクターの補間情報
+                - time: フレーム時刻
             
         Returns:
             combined_splats: 統合されたガウシアンパラメータ
         """
+        # frame_dataが提供された場合はそこから情報を取得
+        if frame_data is not None:
+            time = frame_data["time"]
+            visible_actors = frame_data.get("actor_interpolation", {})
+        else:
+            # 後方互換性：すべてのアクターを処理
+            if time is None:
+                raise ValueError("Either time or frame_data must be provided")
+            visible_actors = {int(actor_id): None for actor_id in self.dynamic_splats.keys()}
+        
         combined = {}
         
         # パラメータリストを準備
@@ -309,13 +324,17 @@ class DynamicGaussianSplats(nn.Module):
                 params_list[key] = []
             params_list[key].append(param)
         
-        # 動的ガウシアンを変換して追加
-        for actor_id in self.dynamic_splats.keys():
-            transformed = self.transform_dynamic_gaussians(int(actor_id), time)
-            for key, param in transformed.items():
-                if key not in params_list:
-                    params_list[key] = []
-                params_list[key].append(param)
+        # 可視動的ガウシアンのみを変換して追加
+        for actor_id, interp_info in visible_actors.items():
+            actor_key = str(actor_id)
+            if actor_key in self.dynamic_splats:
+                # 補間情報が提供されている場合は使用（将来の拡張用）
+                # 現在はtime情報のみ使用
+                transformed = self.transform_dynamic_gaussians(int(actor_id), time)
+                for key, param in transformed.items():
+                    if key not in params_list:
+                        params_list[key] = []
+                    params_list[key].append(param)
         
         # パラメータを結合
         for key, param_list in params_list.items():
@@ -323,9 +342,10 @@ class DynamicGaussianSplats(nn.Module):
                 combined[key] = torch.cat(param_list, dim=0)
             else:
                 # 空の場合は適切なshapeの空テンソルを作成
-                combined[key] = torch.empty((0, param_list[0].shape[1]), 
-                                          device=self.device, 
-                                          dtype=param_list[0].dtype)
+                if len(param_list) > 0:
+                    combined[key] = torch.empty((0, param_list[0].shape[1]), 
+                                              device=self.device, 
+                                              dtype=param_list[0].dtype)
         
         return combined
     

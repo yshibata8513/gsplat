@@ -42,14 +42,19 @@ def depth_colorize(depth, min_depth=None, max_depth=None):
     
     return colored
 
-def full_pointcloud_render():
-    """全点群を使用した深度色付きレンダリング"""
+def full_pointcloud_render(output_dir="results/full_render", middle_idx=None):
+    """全点群を使用した深度色付きレンダリング
+    
+    Args:
+        output_dir: 出力ディレクトリパス
+        middle_idx: 使用するフレームインデックス（Noneの場合は中間フレーム）
+    """
     print("=" * 60)
     print("Full Point Cloud Dynamic Render Test")
     print("=" * 60)
     
     # 出力ディレクトリ
-    os.makedirs("results/full_render", exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     
     # データセット
     dataset = PandaSetDataset(
@@ -60,39 +65,43 @@ def full_pointcloud_render():
     
     print(f"Dataset: {len(dataset)} frames")
     
-    # 全静的点群を使用（メモリ制約で一部をサンプリング）
-    # 真ん中くらいのインデックス（時刻）を使用。以降一貫してこのデータのみでレンダリング結果の検証を行う。
-    middle_idx = len(dataset) // 2
+    # フレームインデックスの決定
+    if middle_idx is None:
+        middle_idx = len(dataset) // 2
     sample = dataset[middle_idx]
-    total_static = len(sample["static_points"])
-    sample_time = sample["time"]  # この時刻を保存
+    sample_time = sample["time"]
     print(f"Using middle frame {middle_idx} at time {sample_time:.3f}")
-
+    
+    # データセットから直接静的点群を取得（内部属性にアクセス）
+    total_static = len(dataset.static_points)
     
     # メモリ制約を考慮して300K点をサンプリング
     static_sample_rate = min(1.0, 300000 / total_static)
     static_indices = np.random.choice(total_static, 
                                     int(total_static * static_sample_rate), 
                                     replace=False)
-    static_points = sample["static_points"][static_indices].numpy()
+    static_points = dataset.static_points[static_indices].copy()
     
     print(f"Static points: {len(static_points):,} (sampled from {total_static:,})")
     
-    # 全動的物体を含める（大きすぎる場合は制限）
+    # 可視アクターのみを取得
+    visible_actors = sample["actor_interpolation"]
     selected_actors = {}
     total_dynamic = 0
     
-    for actor_id, points in sample["dynamic_points"].items():
-        # 各アクターを制限（メモリ効率のため）
-        max_points_per_actor = 2000
-        if len(points) > max_points_per_actor:
-            indices = np.random.choice(len(points), max_points_per_actor, replace=False)
-            selected_actors[actor_id] = points[indices].numpy()
-        else:
-            selected_actors[actor_id] = points.numpy()
-        total_dynamic += len(selected_actors[actor_id])
+    for actor_id, interp_info in visible_actors.items():
+        if actor_id in dataset.dynamic_points:
+            points = dataset.dynamic_points[actor_id]
+            # 各アクターを制限（メモリ効率のため）
+            max_points_per_actor = 2000
+            if len(points) > max_points_per_actor:
+                indices = np.random.choice(len(points), max_points_per_actor, replace=False)
+                selected_actors[actor_id] = points[indices].copy()
+            else:
+                selected_actors[actor_id] = points.copy()
+            total_dynamic += len(selected_actors[actor_id])
     
-    print(f"Dynamic actors: {len(selected_actors)}")
+    print(f"Visible actors: {len(selected_actors)}")
     print(f"Dynamic points: {total_dynamic:,}")
     print(f"Total points: {len(static_points) + total_dynamic:,}")
     
@@ -157,9 +166,13 @@ def full_pointcloud_render():
     # この時点でsampleのカメラパラメータを使って点群を深度で色分け、動的物体は白
     print("\nApplying depth-based coloring to point clouds...")
     
-    # カメラパラメータを取得
-    camtoworld = sample["camtoworld"].numpy()
-    K = sample["K"].numpy()
+    # カメラパラメータを取得（すでにtensorとして返される）
+    camtoworld = sample["camtoworld"]
+    K = sample["K"]
+    if isinstance(camtoworld, torch.Tensor):
+        camtoworld = camtoworld.numpy()
+    if isinstance(K, torch.Tensor):
+        K = K.numpy()
     
     # カメラ座標系への変換行列
     worldtocam = np.linalg.inv(camtoworld)
@@ -183,6 +196,94 @@ def full_pointcloud_render():
     print(f"✓ Applied depth-based colors (depth range: {depth_min:.1f}m - {depth_max:.1f}m)")
     print(f"  Static: Turbo colormap, Dynamic: White")
     
+    # 手動レンダリング（点群投影による可視化）
+    print("\nCreating manual point cloud projection...")
+    
+    # 画像サイズ
+    width, height = sample["width"], sample["height"]
+    
+    # 動的アクターの点群もワールド座標に変換
+    dynamic_points_world = []
+    for actor_id, points in selected_actors.items():
+        # 姿勢行列を取得
+        pose_matrix = dataset.interpolate_actor_pose(actor_id, sample_time)
+        # ローカル座標→ワールド座標変換
+        points_xyz = points[:, :3]
+        colors = points[:, 3:]
+        points_homogeneous = np.hstack([points_xyz, np.ones((len(points_xyz), 1))])
+        world_points = (pose_matrix @ points_homogeneous.T).T[:, :3]
+        dynamic_points_world.append(np.hstack([world_points, colors]))
+    
+    # 全ての点群を統合
+    all_points = [static_points]
+    all_points.extend(dynamic_points_world)
+    combined_points = np.vstack(all_points)
+    
+    # カメラ座標系に変換
+    combined_xyz = combined_points[:, :3]
+    combined_colors = combined_points[:, 3:6]
+    
+    combined_cam = (worldtocam[:3, :3] @ combined_xyz.T + worldtocam[:3, 3:4]).T
+    
+    # カメラ前方の点のみ投影
+    front_mask = combined_cam[:, 2] > 0.1  # 最小深度0.1m
+    if np.any(front_mask):
+        front_cam = combined_cam[front_mask]
+        front_colors = combined_colors[front_mask]
+        
+        # 画像平面に投影
+        proj_points = K @ front_cam.T
+        proj_points = proj_points[:2] / proj_points[2:3]
+        proj_points = proj_points.T  # [N, 2]
+        
+        # 画像範囲内の点のみ
+        in_bounds_mask = (
+            (proj_points[:, 0] >= 0) & (proj_points[:, 0] < width) &
+            (proj_points[:, 1] >= 0) & (proj_points[:, 1] < height)
+        )
+        
+        if np.any(in_bounds_mask):
+            proj_points_valid = proj_points[in_bounds_mask]
+            colors_valid = front_colors[in_bounds_mask]
+            
+            # 手動レンダリング画像を作成
+            manual_render = np.zeros((height, width, 3), dtype=np.float32)
+            
+            # 点を描画（簡単な点描画）
+            for i, (px, py) in enumerate(proj_points_valid):
+                x, y = int(px), int(py)
+                if 0 <= x < width and 0 <= y < height:
+                    manual_render[y, x] = colors_valid[i]
+            
+            print(f"✓ Manual projection: {len(proj_points_valid):,} points projected")
+    else:
+        manual_render = np.zeros((height, width, 3), dtype=np.float32)
+        print("⚠ No points in front of camera")
+    
+    # 結果を保存（3枚の画像：Ground Truth, Manual Projection, Rasterized）
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    
+    # Ground Truth
+    target_np = sample["image"].cpu().numpy() / 255.0
+    axes[0].imshow(np.clip(target_np, 0, 1))
+    axes[0].set_title(f"Ground Truth\nFrame {middle_idx}", fontsize=14)
+    axes[0].axis('off')
+    
+    # Manual Projection
+    axes[1].imshow(np.clip(manual_render, 0, 1))
+    axes[1].set_title(f"Manual Point Projection\n{len(combined_points):,} points", fontsize=14)
+    axes[1].axis('off')
+    
+    # Placeholder for rasterized (will be filled later)
+    axes[2].imshow(np.zeros_like(target_np))
+    axes[2].set_title("Rasterized Rendering\n(Processing...)", fontsize=14)
+    axes[2].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/manual_projection_comparison.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"✓ Manual projection saved to {output_dir}/manual_projection_comparison.png")
 
     # 初期レンダリングを実行して色付け確認
     print("\nPerforming initial rendering with colored point clouds...")
@@ -213,8 +314,8 @@ def full_pointcloud_render():
     
     # dynamic_splats.get_combined_gaussiansでデータを取り出し、rasterizationを使ってrender
     with torch.no_grad():
-        # 統合ガウシアンを取得
-        combined = dynamic_splats.get_combined_gaussians(float(sample_time))
+        # 統合ガウシアンを取得（frame_dataを渡す）
+        combined = dynamic_splats.get_combined_gaussians(frame_data=sample)
         
         # カメラパラメータをGPUに転送
         camtoworld_cuda = sample["camtoworld"].unsqueeze(0).cuda()
@@ -260,138 +361,36 @@ def full_pointcloud_render():
             align_corners=False
         ).permute(0, 2, 3, 1).squeeze(0).cpu().numpy()
     
-    # 初期レンダリング結果を保存
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    # 完全な比較画像を更新
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
     
+    # Ground Truth
     axes[0].imshow(target_resized)
-    axes[0].set_title(f"Ground Truth (Frame {middle_idx})")
+    axes[0].set_title(f"Ground Truth\nFrame {middle_idx}", fontsize=14)
     axes[0].axis('off')
     
-    axes[1].imshow(np.clip(initial_render, 0, 1))
-    axes[1].set_title(f"Initial Colored Render\n(Static: Depth-colored, Dynamic: White)")
+    # Manual Projection (resize to match)
+    manual_resized = cv2.resize(manual_render, (render_size, render_size))
+    axes[1].imshow(np.clip(manual_resized, 0, 1))
+    axes[1].set_title(f"Manual Point Projection\n{len(combined_points):,} points", fontsize=14)
     axes[1].axis('off')
     
-    axes[2].imshow(initial_alpha, cmap='viridis')
-    axes[2].set_title(f"Alpha Channel\n(Mean: {initial_alpha.mean():.3f})")
+    # Rasterized Rendering
+    axes[2].imshow(np.clip(initial_render, 0, 1))
+    axes[2].set_title(f"Rasterized Rendering\n{dynamic_splats.get_total_count():,} gaussians", fontsize=14)
     axes[2].axis('off')
     
     plt.tight_layout()
-    plt.savefig("results/full_render/initial_colored_render.png", dpi=150, bbox_inches='tight')
+    plt.savefig(f"{output_dir}/final_comparison.png", dpi=150, bbox_inches='tight')
     plt.close()
     
-    print(f"✓ Initial rendering saved to results/full_render/initial_colored_render.png")
-    print(f"  Rendered gaussians: {info.get('n_render', 'unknown')}")
+    print(f"✓ Final comparison saved to {output_dir}/final_comparison.png")
+    print(f"  Manual projection: {len(combined_points):,} points")
+    print(f"  Rasterized rendering: {dynamic_splats.get_total_count():,} gaussians")
     print(f"  RGB range: [{initial_render.min():.3f}, {initial_render.max():.3f}]")
     
-    # 以降の処理ではset_depth_colorsを使わない（色はすでに設定済み）
-    # set_depth_colors(dynamic_splats)  # コメントアウト
-    
-    # 高解像度でレンダリング
-    render_size = 512
-    
-    # middle_idx前後しかposeを登録していないので、middle_idxのみレンダリング
-    frames_to_render = [middle_idx]
-    results = []
-    
-    for i, frame_idx in enumerate(frames_to_render):
-        if frame_idx >= len(dataset):
-            frame_idx = len(dataset) - 1
-            
-        sample = dataset[frame_idx]
-        time_val = sample["time"]
-        camtoworld = sample["camtoworld"].unsqueeze(0).cuda()
-        K = sample["K"].unsqueeze(0).cuda()
-        target = sample["image"].unsqueeze(0).cuda() / 255.0
-        
-        print(f"\nRendering frame {frame_idx} (time: {time_val:.3f})...")
-        
-        # リサイズ
-        H, W = target.shape[1:3]
-        target_resized = F.interpolate(
-            target.permute(0, 3, 1, 2),
-            size=(render_size, render_size),
-            mode='bilinear',
-            align_corners=False
-        ).permute(0, 2, 3, 1)
-        
-        # カメラパラメータ調整
-        K_resized = K.clone()
-        K_resized[:, 0, 2] *= render_size / W  # cx
-        K_resized[:, 1, 2] *= render_size / H  # cy
-        K_resized[:, 0, 0] *= render_size / W  # fx
-        K_resized[:, 1, 1] *= render_size / H  # fy
-        
-        # 統合レンダリング（深度付き）
-        with torch.no_grad():
-            combined = dynamic_splats.get_combined_gaussians(float(time_val))
-            
-            # 色はすでに設定済み（静的: 深度色、動的: 白）
-            colors = combined["sh0"]
-            
-            renders, alphas, info = rasterization(
-                means=combined["means"],
-                quats=F.normalize(combined["quats"], dim=-1),
-                scales=torch.exp(combined["scales"]),
-                opacities=torch.sigmoid(combined["opacities"]),
-                colors=colors,
-                viewmats=torch.linalg.inv(camtoworld),
-                Ks=K_resized,
-                width=render_size,
-                height=render_size,
-                sh_degree=0,
-                near_plane=0.1,
-                far_plane=200.0,
-            )
-            
-            # 深度は座標から計算
-            rgb_render = renders
-            
-            # カメラから各ピクセルまでの深度を計算
-            means_cam = torch.matmul(combined["means"], torch.linalg.inv(camtoworld).squeeze(0)[:3, :3].T) + torch.linalg.inv(camtoworld).squeeze(0)[:3, 3]
-            depths = means_cam[:, 2]  # Z座標が深度
-            
-            # レンダリング重みに基づいて深度マップを作成（簡易版）
-            depth_map = torch.zeros((render_size, render_size), device=combined["means"].device)
-            alpha_2d = alphas.squeeze(0).squeeze(-1)
-            
-            # 平均深度を使用
-            mean_depth = depths.mean().item()
-            depth_render = torch.full((render_size, render_size), mean_depth, device=combined["means"].device).unsqueeze(-1)
-        
-        # 結果を保存
-        target_np = target_resized.squeeze(0).cpu().numpy()
-        rgb_np = rgb_render.squeeze(0).cpu().numpy()
-        alpha_np = alphas.squeeze(0).cpu().numpy()
-        
-        # 深度を色付きで表示
-        depth_np = depth_render.squeeze(-1).cpu().numpy()  # [H, W]
-        depth_colored = depth_colorize(depth_np, min_depth=2.0, max_depth=50.0)
-        
-        # クリップして正規化
-        target_np = np.clip(target_np, 0, 1)
-        rgb_np = np.clip(rgb_np, 0, 1)
-        alpha_np = np.clip(alpha_np, 0, 1)
-        
-        results.append({
-            'frame': frame_idx,
-            'time': time_val,
-            'target': target_np,
-            'render': rgb_np,
-            'depth': depth_colored,
-            'alpha': alpha_np,
-            'n_gaussians': dynamic_splats.get_total_count()
-        })
-        
-        print(f"  Rendered gaussians: {info.get('n_render', 'unknown')}")
-        print(f"  RGB range: [{rgb_np.min():.3f}, {rgb_np.max():.3f}]")
-        print(f"  Alpha range: [{alpha_np.min():.3f}, {alpha_np.max():.3f}]")
-        print(f"  Mean alpha: {alpha_np.mean():.3f}")
-    
-    # 結果画像を作成
-    create_full_comparison(results, "results/full_render")
-    
     print("✅ Full point cloud render test completed!")
-    print("Check results/full_render/ for output images")
+    print(f"Check {output_dir}/ for output images")
 
 def set_depth_colors_unused(dynamic_splats):
     """深度に基づいて色を設定（未使用）"""
@@ -498,4 +497,11 @@ def create_full_comparison(results, output_dir):
     print(f"Saved comparison images to {output_dir}")
 
 if __name__ == "__main__":
-    full_pointcloud_render()
+    import argparse
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output-dir", type=str, default="results/full_render", help="Output directory")
+    parser.add_argument("--middle-idx", type=int, default=None, help="Frame index to use (default: middle frame)")
+    args = parser.parse_args()
+    
+    full_pointcloud_render(output_dir=args.output_dir, middle_idx=args.middle_idx)

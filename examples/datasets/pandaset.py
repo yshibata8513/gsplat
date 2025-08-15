@@ -51,6 +51,7 @@ class PandaSetDataset(Dataset):
         patch_size: Optional[int] = None,
         load_depths: bool = False,
         device: str = "cuda",
+        visibility_margin: float = 20.0,  # 視野外マージン（メートル）
     ):
         """
         Args:
@@ -60,6 +61,7 @@ class PandaSetDataset(Dataset):
             patch_size: パッチ学習用のサイズ（実験的）
             load_depths: 深度情報を読み込むか（現在未対応）
             device: Tensorデバイス
+            visibility_margin: 視野判定のマージン（学習中の動きを考慮）
         """
         self.data_dir = Path(data_dir)
         self.split = split
@@ -67,6 +69,7 @@ class PandaSetDataset(Dataset):
         self.patch_size = patch_size
         self.load_depths = load_depths
         self.device = device
+        self.visibility_margin = visibility_margin
         
         # データ読み込み
         self._load_metadata()
@@ -75,6 +78,9 @@ class PandaSetDataset(Dataset):
         self._load_actor_poses()
         self._load_camera_data()
         self._split_frames()
+        
+        # 各フレームでの可視アクターと補間情報を事前計算
+        self._precompute_frame_actors()
         
         print(f"PandaSetDataset loaded:")
         print(f"  Static points: {len(self.static_points)}")
@@ -185,6 +191,189 @@ class PandaSetDataset(Dataset):
             self.frame_indices = [i for i in range(num_frames) if i % self.test_every == 0]
         else:
             raise ValueError(f"Unknown split: {self.split}")
+    
+    def _check_actor_visibility(self, actor_id: int, time: float, 
+                               camtoworld: np.ndarray, K: np.ndarray,
+                               width: int, height: int) -> bool:
+        """
+        アクターがカメラ視野内にあるかチェック（マージン付き）
+        
+        Args:
+            actor_id: アクターID
+            time: 時刻
+            camtoworld: カメラ→ワールド変換行列 [4, 4]
+            K: カメラ内部パラメータ [3, 3]
+            width, height: 画像サイズ
+            
+        Returns:
+            bool: 視野内（またはマージン内）にある場合True
+        """
+        if actor_id not in self.dynamic_points:
+            return False
+        
+        # アクター点群をワールド座標に変換
+        pose_matrix = self.interpolate_actor_pose(actor_id, time)
+        local_points = self.dynamic_points[actor_id][:, :3]  # [N, 3]
+        
+        # 代表点を使用（重心のみ）
+        center = local_points.mean(axis=0)
+        
+        # 代表点をワールド座標に変換（centerのみ使用）
+        test_points = center.reshape(1, 3)  # [1, 3]
+        test_points_h = np.hstack([test_points, np.ones((len(test_points), 1))])  # [1, 4]
+        world_points = (pose_matrix @ test_points_h.T).T[:, :3]  # [1, 3]
+        
+        # カメラ座標系に変換
+        worldtocam = np.linalg.inv(camtoworld)
+        cam_points = (worldtocam[:3, :3] @ world_points.T + worldtocam[:3, 3:4]).T  # [1, 3]
+        
+        
+        # Z > 0（カメラ前方）のチェック
+        if np.all(cam_points[:, 2] <= 0):
+            return False
+        
+        # 有効な点のみを投影
+        valid_mask = cam_points[:, 2] > 0
+        valid_cam_points = cam_points[valid_mask]
+        
+        if len(valid_cam_points) == 0:
+            return False
+        
+        # 画像平面に投影
+        proj_points = valid_cam_points @ K.T  # [N_valid, 3]
+        proj_points = proj_points[:, :2] / proj_points[:, 2:3]  # [N_valid, 2]
+        
+        # 画像範囲＋マージンのチェック
+        margin_pixels = self.visibility_margin * K[0, 0] / valid_cam_points[:, 2].mean()  # 深度に応じたピクセルマージン
+        
+        in_bounds = (
+            (proj_points[:, 0] >= -margin_pixels) & 
+            (proj_points[:, 0] < width + margin_pixels) &
+            (proj_points[:, 1] >= -margin_pixels) & 
+            (proj_points[:, 1] < height + margin_pixels)
+        )
+        
+        return np.any(in_bounds)
+    
+    def _get_interpolation_info(self, actor_id: int, target_time: float) -> Dict:
+        """
+        アクターの補間情報を取得
+        
+        Args:
+            actor_id: アクターID
+            target_time: 対象時刻
+            
+        Returns:
+            補間情報の辞書:
+            - indices: 補間に使用する姿勢のインデックス [2]
+            - times: 補間に使用する時刻 [2]
+            - alpha: 補間係数（0: 最初の姿勢, 1: 次の姿勢）
+        """
+        if actor_id not in self.actor_poses:
+            return {
+                "indices": [0, 0],
+                "times": [target_time, target_time],
+                "alpha": 0.0,
+                "valid": False
+            }
+        
+        actor_data = self.actor_poses[actor_id]
+        times = actor_data["times"]
+        
+        if len(times) == 0:
+            return {
+                "indices": [0, 0],
+                "times": [target_time, target_time],
+                "alpha": 0.0,
+                "valid": False
+            }
+        
+        # 時刻範囲外の場合
+        if target_time <= times[0]:
+            return {
+                "indices": [0, 0],
+                "times": [times[0], times[0]],
+                "alpha": 0.0,
+                "valid": True
+            }
+        if target_time >= times[-1]:
+            last_idx = len(times) - 1
+            return {
+                "indices": [last_idx, last_idx],
+                "times": [times[-1], times[-1]],
+                "alpha": 0.0,
+                "valid": True
+            }
+        
+        # 線形補間用のインデックスを見つける
+        idx = np.searchsorted(times, target_time)
+        
+        # 補間係数を計算
+        t0, t1 = times[idx-1], times[idx]
+        alpha = (target_time - t0) / (t1 - t0)
+        
+        return {
+            "indices": [idx-1, idx],
+            "times": [t0, t1],
+            "alpha": float(alpha),
+            "valid": True
+        }
+    
+    def _precompute_frame_actors(self):
+        """
+        各フレームでの可視アクターと補間情報を事前計算
+        """
+        print("Precomputing visible actors for each frame...")
+        self.frame_actor_info = {}
+        
+        for frame_idx in range(len(self.all_frames)):
+            frame_data = self.all_frames[frame_idx]
+            time = frame_data["time"]
+            width, height = int(frame_data["width"]), int(frame_data["height"])
+            
+            # カメラパラメータ
+            K = np.array([
+                [frame_data["fx"], 0, frame_data["cx"]],
+                [0, frame_data["fy"], frame_data["cy"]],
+                [0, 0, 1]
+            ], dtype=np.float32)
+            
+            # カメラ外部パラメータ
+            camera_to_world_gl = np.array(frame_data["camera_to_world"], dtype=np.float32)
+            if camera_to_world_gl.shape == (3, 4):
+                c2w_gl = np.eye(4, dtype=np.float32)
+                c2w_gl[:3, :] = camera_to_world_gl
+            else:
+                c2w_gl = camera_to_world_gl
+            
+            # OpenGL→OpenCV座標変換
+            gl_to_cv = np.eye(4, dtype=np.float32)
+            gl_to_cv[1, 1] = -1.0
+            gl_to_cv[2, 2] = -1.0
+            camtoworld = c2w_gl @ gl_to_cv
+            
+            # 可視アクターをチェック
+            visible_actors = {}
+            for actor_id in self.dynamic_points.keys():
+                if self._check_actor_visibility(actor_id, time, camtoworld, K, width, height):
+                    # 補間情報を取得
+                    interp_info = self._get_interpolation_info(actor_id, time)
+                    visible_actors[actor_id] = interp_info
+            
+            self.frame_actor_info[frame_idx] = {
+                "time": time,
+                "visible_actors": visible_actors,
+                "camtoworld": camtoworld,  # 保存して再利用
+                "K": K,
+                "width": width,
+                "height": height
+            }
+            
+            if frame_idx % 10 == 0:
+                print(f"  Frame {frame_idx}/{len(self.all_frames)}: {len(visible_actors)} visible actors")
+        
+        print(f"Precomputation complete. Average visible actors: "
+              f"{np.mean([len(info['visible_actors']) for info in self.frame_actor_info.values()]):.1f}")
     
     def __len__(self) -> int:
         return len(self.frame_indices)
@@ -297,59 +486,26 @@ class PandaSetDataset(Dataset):
                 "K": torch.Tensor [3, 3],
                 "width": int,
                 "height": int,
-                "static_points": torch.Tensor [N_static, 6],
-                "dynamic_points": Dict[int, torch.Tensor],  # actor_id -> [N_actor, 6] (local coords)
-                "actor_poses": Dict[int, torch.Tensor],     # actor_id -> [4, 4] world pose
+                "actor_interpolation": Dict[int, Dict],  # actor_id -> interpolation info
             }
         """
         frame_idx = self.frame_indices[idx]
-        frame_data = self.all_frames[frame_idx]
         
-        # 基本情報
-        time = frame_data["time"]
-        width, height = int(frame_data["width"]), int(frame_data["height"])
+        # 事前計算された情報を取得
+        frame_info = self.frame_actor_info[frame_idx]
         
-        # カメラ内部パラメータ
-        K = torch.tensor([
-            [frame_data["fx"], 0, frame_data["cx"]],
-            [0, frame_data["fy"], frame_data["cy"]],
-            [0, 0, 1]
-        ], dtype=torch.float32)
+        # 保存されたカメラパラメータを使用
+        camtoworld = torch.from_numpy(frame_info["camtoworld"])
+        K = torch.from_numpy(frame_info["K"])
+        width = frame_info["width"]
+        height = frame_info["height"]
+        time = frame_info["time"]
         
-        # カメラ外部パラメータ（OpenGL→OpenCV座標系変換）
-        camera_to_world_gl = np.array(frame_data["camera_to_world"], dtype=np.float32)
-        if camera_to_world_gl.shape == (3, 4):
-            # 3x4 -> 4x4
-            c2w_gl = np.eye(4, dtype=np.float32)
-            c2w_gl[:3, :] = camera_to_world_gl
-        else:
-            c2w_gl = camera_to_world_gl
-        
-        # OpenGL→OpenCV座標変換（Y軸、Z軸反転）
-        gl_to_cv = np.eye(4, dtype=np.float32)
-        gl_to_cv[1, 1] = -1.0  # Y軸反転
-        gl_to_cv[2, 2] = -1.0  # Z軸反転
-        
-        c2w_cv = c2w_gl @ gl_to_cv
-        camtoworld = torch.from_numpy(c2w_cv)
-        
-        # カメラ画像の読み込み（デモ用：グレー画像生成）
-        # 実際のプロジェクトでは extracted_data/camera_images から読み込み
+        # カメラ画像の読み込み
         image = self._load_camera_image(frame_idx, width, height)
         
-        # 静的点群
-        static_points = torch.from_numpy(self.static_points)
-        
-        # 動的点群（ローカル座標）
-        dynamic_points = {}
-        for actor_id, points in self.dynamic_points.items():
-            dynamic_points[actor_id] = torch.from_numpy(points)
-        
-        # アクター姿勢
-        actor_poses = {}
-        for actor_id in self.dynamic_points.keys():
-            pose = self.interpolate_actor_pose(actor_id, time)
-            actor_poses[actor_id] = torch.from_numpy(pose)
+        # 可視アクターと補間情報
+        actor_interpolation = frame_info["visible_actors"]
         
         return {
             "frame_id": frame_idx,
@@ -359,9 +515,7 @@ class PandaSetDataset(Dataset):
             "K": K,
             "width": width,
             "height": height,
-            "static_points": static_points,
-            "dynamic_points": dynamic_points,
-            "actor_poses": actor_poses,
+            "actor_interpolation": actor_interpolation,
         }
     
     def _load_camera_image(self, frame_id: int, width: int, height: int) -> torch.Tensor:
