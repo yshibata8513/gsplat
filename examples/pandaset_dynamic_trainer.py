@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import imageio
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -57,8 +58,8 @@ class DynamicConfig:
     save_steps: List[int] = field(default_factory=lambda: [1000, 3000, 5000])
     
     # Model parameters
-    init_scale: float = 0.3
-    init_opa: float = 0.8
+    init_scale: float = 0.01
+    init_opa: float = 0.3
     sh_degree: int = 0  # 色は点群から設定するため0
     
     # Learning rates - static gaussians
@@ -114,6 +115,10 @@ class DynamicRunner:
         os.makedirs(self.ckpt_dir, exist_ok=True)
         self.render_dir = f"{cfg.result_dir}/renders"
         os.makedirs(self.render_dir, exist_ok=True)
+        
+        # 画像比較カウンター
+        self.comparison_counter = 0
+        self.initial_projection_test = True
         
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
@@ -192,7 +197,9 @@ class DynamicRunner:
         # Random colors for dynamic objects  
         for actor_id, points in selected_actors.items():
             dynamic_colors = np.random.rand(len(points), 3)
-            selected_actors[actor_id][:, 3:6] = dynamic_colors
+            if self.initial_projection_test:
+                dynamic_colors = np.ones_like(dynamic_colors)
+            selected_actors[actor_id][:, 3:6] = dynamic_colors               
         
         # Build actor poses
         actor_poses = {}
@@ -210,12 +217,21 @@ class DynamicRunner:
                     "poses": [np.eye(4, dtype=np.float32)]
                 }
         
-        # Create dynamic system
-        init_params = {
-            "init_scale": self.cfg.init_scale,
-            "init_opa": self.cfg.init_opa,
-            "sh_degree": self.cfg.sh_degree,
-        }
+        if self.initial_projection_test:
+            # Create dynamic system
+            init_params = {
+                "init_scale": self.cfg.init_scale,
+                "init_opa": self.cfg.init_opa,
+                "sh_degree": self.cfg.sh_degree,
+                "fixed_scale": True,
+            }
+        else:
+            # Create dynamic system
+            init_params = {
+                "init_scale": self.cfg.init_scale,
+                "init_opa": self.cfg.init_opa,
+                "sh_degree": self.cfg.sh_degree,
+            }
         
         self.dynamic_system = create_dynamic_splats_from_points(
             static_points=static_points,
@@ -336,6 +352,50 @@ class DynamicRunner:
             far_plane=self.cfg.far_plane,
         )
         render_time = time.time() - render_start
+        
+        # 画像と点群の整合性チェック（初期状態確認用）
+        if self.initial_projection_test:
+            self.comparison_counter += 1
+            
+            # 元画像、レンダリング結果、重ね合わせの3画像を保存
+            gt_image = image_gt.detach().cpu().numpy()[0]  # [H, W, 3]
+            render_image = renders.detach().cpu().numpy()[0]  # [H, W, 3]
+            
+            # 重ね合わせ画像（0.5ずつブレンド）
+            overlay_image = 0.5 * gt_image + 0.5 * render_image
+            
+            # 保存ディレクトリ作成
+            comparison_dir = Path(self.cfg.result_dir) / "comparison_check"
+            comparison_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 3つの画像を横並びで配置
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            
+            axes[0].imshow(gt_image)
+            axes[0].set_title('Ground Truth')
+            axes[0].axis('off')
+            
+            axes[1].imshow(render_image)
+            axes[1].set_title('Rendered')
+            axes[1].axis('off')
+            
+            axes[2].imshow(overlay_image)
+            axes[2].set_title('Overlay (50/50)')
+            axes[2].axis('off')
+            
+            plt.tight_layout()
+            
+            # ファイル名に比較カウンタを含める
+            filename = f"comparison_iter_{self.comparison_counter:02d}.png"
+            plt.savefig(comparison_dir / filename, dpi=150, bbox_inches='tight')
+            plt.close()
+            
+            print(f"Comparison image saved: {filename}")
+            
+            # 5回実行したら強制終了
+            if self.comparison_counter >= 5:
+                print(f"\nComparison check completed after {self.comparison_counter} iterations. Exiting...")
+                return
         
         # Loss computation
         loss_start = time.time()
